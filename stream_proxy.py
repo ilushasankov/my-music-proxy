@@ -1,13 +1,13 @@
+# stream_proxy.py
+
 import base64
 import asyncio
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-import aiohttp
 
 app = FastAPI()
 
-CLIENT_TIMEOUT = aiohttp.ClientTimeout(total=None, connect=30, sock_connect=30, sock_read=300)
-
+# Словарь MIME-типов, как у вас, очень полезен
 MIME_TYPES = {
     'mp3': 'audio/mpeg',
     'm4a': 'audio/mp4',
@@ -15,52 +15,89 @@ MIME_TYPES = {
     'opus': 'audio/opus',
     'flac': 'audio/flac',
     'wav': 'audio/wav',
+    'webm': 'audio/webm',
 }
 
-async def stream_audio_from_url(url: str):
-    try:
-        async with aiohttp.ClientSession(timeout=CLIENT_TIMEOUT) as session:
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-            }
-            async with session.get(url, headers=headers) as response:
-                response.raise_for_status()
-                async for chunk in response.content.iter_chunked(1024 * 64):
-                    yield chunk
-                    await asyncio.sleep(0.001)
-    except aiohttp.ClientError as e:
-        print(f"Proxy Error: aiohttp client error: {e}")
-        raise HTTPException(status_code=502, detail=f"Failed to fetch content from upstream: {e}")
-    except Exception as e:
-        print(f"Proxy Error: Unexpected error: {e}")
-        raise HTTPException(status_code=500, detail=f"An internal error occurred: {e}")
+async def stream_from_yt_dlp(track_url: str):
+    """
+    Асинхронный генератор, который запускает yt-dlp как подпроцесс
+    и отдает (yield) его stdout по частям (чанками).
+    """
+    # Команда для запуска yt-dlp:
+    # -f bestaudio/best: выбрать лучшее качество аудио
+    # -o -: выводить результат в stdout, а не в файл
+    # --quiet: не выводить лишнюю информацию в stderr
+    args = [
+        'yt-dlp',
+        '--quiet',
+        '-f', 'bestaudio/best',
+        '-o', '-',
+        track_url
+    ]
+
+    # Создаем асинхронный подпроцесс
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE  # Перехватываем ошибки тоже
+    )
+
+    # Асинхронно читаем stdout, пока процесс не завершится
+    while True:
+        try:
+            # Читаем чанк данных из stdout
+            chunk = await process.stdout.read(1024 * 64) # 64 KB
+            if not chunk:
+                # Если чанк пустой, значит поток закончился
+                break
+            yield chunk
+        except asyncio.CancelledError:
+            # Если клиент (Telegram) разорвал соединение, останавливаем процесс
+            print(f"Client disconnected, terminating process for {track_url}")
+            process.terminate()
+            await process.wait()
+            raise
+        except Exception as e:
+            print(f"Error while streaming from yt-dlp: {e}")
+            process.kill()
+            await process.wait()
+            break # Прерываем цикл в случае ошибки
+
+    # Ждем завершения процесса и проверяем код возврата
+    return_code = await process.wait()
+    if return_code != 0:
+        # Если yt-dlp завершился с ошибкой, логируем ее
+        error_output = await process.stderr.read()
+        print(f"yt-dlp failed for {track_url} with code {return_code}: {error_output.decode()}")
+
 
 @app.get("/stream/{encoded_payload}")
-async def proxy_stream(encoded_payload: str):
+async def proxy_stream_hls(encoded_payload: str):
     """
-    Основной эндпоинт прокси.
-    Принимает payload (URL|расширение), закодированный в Base64.
+    Основной эндпоинт, который принимает закодированный URL страницы трека
+    и его расширение, а затем стримит аудиопоток от yt-dlp.
     """
     try:
         decoded_payload = base64.urlsafe_b64decode(encoded_payload).decode('utf-8')
-        # Разделяем строку на URL и расширение
-        parts = decoded_payload.split('|')
+        parts = decoded_payload.split('|', 1) # Разделяем только один раз
         if len(parts) != 2:
-            raise ValueError("Invalid payload format. Expected 'url|extension'.")
+            raise ValueError("Invalid payload format. Expected 'webpage_url|extension'.")
         
-        audio_url, extension = parts
-        print(f"Proxying request for: {audio_url[:80]}... (Format: {extension})")
+        track_url, extension = parts
+        print(f"Proxying HLS stream for: {track_url} (Format: {extension})")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
+        raise HTTPException(status_code=400, detail=f"Invalid or malformed payload: {e}")
 
-    # Определяем правильный MIME-тип, с фолбэком на 'application/octet-stream'
-    media_type = MIME_TYPES.get(extension, 'application/octet-stream')
+    # Определяем MIME-тип на основе расширения, полученного от бота
+    media_type = MIME_TYPES.get(extension.lower(), 'application/octet-stream')
 
+    # Возвращаем StreamingResponse, который будет вызывать наш асинхронный генератор
     return StreamingResponse(
-        stream_audio_from_url(audio_url),
-        media_type=media_type # Используем определенный MIME-тип
+        stream_from_yt_dlp(track_url),
+        media_type=media_type
     )
+
 
 @app.get("/")
 def read_root():
-    return {"status": "ok", "message": "Audio stream proxy is running"}
+    return {"status": "ok", "message": "HLS Audio Stream Proxy is running"}
