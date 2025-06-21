@@ -44,11 +44,12 @@ async def get_soundcloud_info(track_url: str) -> dict | None:
 
         # Собираем все в один словарь
         return {
-            'direct_url': direct_url,
+            'webpage_url': info_dict.get('webpage_url', track_url),
             'artist': artist,
             'title': title,
             'duration': info_dict.get('duration'),
             'thumbnail_url': info_dict.get('thumbnail'),
+            'ext': info_dict.get('ext', 'mp3'), # Очень важное поле!
         }
 
     except Exception as e:
