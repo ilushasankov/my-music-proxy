@@ -1,10 +1,10 @@
 import asyncio
 import time
 from typing import Tuple, Optional
-
+import traceback
 from aiogram import Bot
 from aiogram.exceptions import TelegramBadRequest, TelegramAPIError
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, URLInputFile
 from cachetools import TTLCache
 
 from download_functions.database import get_user_daily_downloads, save_user_track, cleanup_expired_cache
@@ -137,7 +137,6 @@ def is_duration_valid(duration: int) -> bool:
 async def download_worker(bot: Bot, queue: asyncio.PriorityQueue, worker_id: str):
     print(f"🔧Воркер скачиваний #{worker_id} запущен...")
     
-    # URL вашего прокси-сервера. ОБЯЗАТЕЛЬНО УКАЖИТЕ В .env
     PROXY_URL = os.getenv('PROXY_URL')
     if not PROXY_URL:
         print("CRITICAL ERROR: PROXY_URL is not set in .env file! Bot will not work.")
@@ -152,58 +151,81 @@ async def download_worker(bot: Bot, queue: asyncio.PriorityQueue, worker_id: str
             await call.message.edit_text("🚀 Готовлю ссылку...")
 
             info = None
-            audio_source = None # Это будет либо ссылка на прокси, либо BufferedInputFile
+            audio_source = None 
+            full_title = ""
+            file_name = "audio.mp3"
 
-            # --- ЛОГИКА ДЛЯ SOUNDCLOUD (ВСЕГДА БЫСТРАЯ) ---
+            # <<< ИЗМЕНЕНИЕ ЛОГИКИ ДЛЯ SOUNDCLOUD >>>
             if source == 'soundcloud':
-                info = await get_soundcloud_info(track_id) # track_id - это полный URL
-                if info and info.get('direct_url'):
-                    # Кодируем URL в base64, чтобы безопасно передать его в нашем URL
-                    encoded_url = base64.urlsafe_b64encode(info['direct_url'].encode()).decode()
-                    # Собираем ссылку на наш прокси
-                    audio_source = f"{PROXY_URL.rstrip('/')}/stream/{encoded_url}"
-                    print(f"[Worker {worker_id}] Generated proxy link for SoundCloud.")
+                # track_id для soundcloud - это и есть URL страницы
+                info = await get_soundcloud_info(track_id) 
+                if info:
+                    full_title = f"{info.get('artist', 'Unknown Artist')} - {info.get('title', 'Unknown Title')}"
+                    
+                    # Получаем URL страницы и расширение файла
+                    webpage_url = info['webpage_url']
+                    extension = info.get('ext', 'mp3')
+                    
+                    # Создаем payload: "URL_страницы|расширение"
+                    payload_to_encode = f"{webpage_url}|{extension}"
+                    
+                    # Кодируем payload в base64 для безопасной передачи в URL
+                    encoded_payload = base64.urlsafe_b64encode(payload_to_encode.encode()).decode()
+                    
+                    # Формируем ссылку на НАШ прокси-сервер
+                    proxy_link = f"{PROXY_URL.rstrip('/')}/stream/{encoded_payload}"
+                    
+                    # Готовим имя файла. Это КРИТИЧЕСКИ важно для Telegram.
+                    file_name = f"{sanitize_filename(full_title)}.{extension}"
+                    
+                    # Создаем URLInputFile с proxy_link и ПРАВИЛЬНЫМ именем файла
+                    audio_source = URLInputFile(proxy_link, filename=file_name)
+                    print(f"[Worker {worker_id}] Generated proxy link for SoundCloud: {file_name}")
                 else:
-                    await call.message.edit_text("❌ Не удалось получить ссылку на трек с SoundCloud.")
-            
-            # --- ЛОГИКА ДЛЯ ДРУГИХ ИСТОЧНИКОВ (ПОКА СТАРАЯ, МЕДЛЕННАЯ) ---
-            elif source == 'yandex':
-                info = await download_track_yandex(track_id)
-            elif source == 'saavn':
-                info = await download_track_saavn(track_id)
-            else: # 'yt'
-                info = await download_track_optimized(track_id)
+                    await call.message.edit_text("❌ Не удалось получить информацию о треке с SoundCloud.")
+                    continue # Переходим к следующей задаче в очереди
 
-            if not info:
-                if not (source == 'soundcloud'): # Для SC сообщение об ошибке уже отправлено
-                   await call.message.edit_text("❌ Не удалось скачать трек. Возможно, он недоступен.")
-                continue
+            # Логика для других источников (yandex, saavn, yt) остается без изменений
+            else:
+                if source == 'yandex': info = await download_track_yandex(track_id)
+                elif source == 'saavn': info = await download_track_saavn(track_id)
+                else: info = await download_track_optimized(track_id)
 
-            # Если это не SoundCloud, аудиофайл находится в 'audio_bytes'
-            if 'audio_bytes' in info:
-                audio_source = BufferedInputFile(info['audio_bytes'], filename="audio.m4a")
+                if not info:
+                    await call.message.edit_text("❌ Не удалось скачать трек. Возможно, он недоступен.")
+                    continue
+
+                if 'audio_bytes' in info:
+                    full_title = f"{info.get('artist', 'Unknown Artist')} - {info.get('title', 'Unknown Title')}"
+                    file_extension = info.get('extension', 'm4a')
+                    file_name = f"{sanitize_filename(full_title)}.{file_extension}"
+                    audio_source = BufferedInputFile(info['audio_bytes'], filename=file_name)
 
             if not audio_source:
                 await call.message.edit_text("❌ Внутренняя ошибка: источник аудио не определен.")
                 continue
 
-            # --- ОБЩАЯ ЛОГИКА ОТПРАВКИ ---
+            # ... (остальная часть функции: подготовка метаданных, отправка)
+            
             title = info.get('title', 'Unknown Title')
             artist = info.get('artist', 'Unknown Artist')
             duration = info.get('duration')
             
-            # Для проксированной ссылки обложку берем по URL, для скачанного файла - из байтов
-            thumbnail = info.get('thumbnail_url') if isinstance(audio_source, str) else \
-                        (BufferedInputFile(info['thumbnail_bytes'], 'thumb.jpg') if info.get('thumbnail_bytes') else None)
+            thumbnail = None
+            if info.get('thumbnail_url'):
+                thumbnail = URLInputFile(info.get('thumbnail_url'))
+            elif info.get('thumbnail_bytes'):
+                thumbnail = BufferedInputFile(info.get('thumbnail_bytes'), 'thumb.jpg')
 
-            full_title = f"{artist} - {title}"
             source_icons = {'yandex': '💛', 'saavn': '💛', 'soundcloud': '☁️', 'yt': '📮'}
+            # Используем full_title, который мы определили ранее
             caption = f"{source_icons.get(source, '🎧')} `{full_title}`"
             
             await call.message.edit_text("✅ Отправляю...")
+            
             await bot.send_audio(
                 chat_id=user_id,
-                audio=audio_source,
+                audio=audio_source, # audio_source уже содержит filename
                 caption=caption,
                 parse_mode="Markdown",
                 title=title,
@@ -216,7 +238,8 @@ async def download_worker(bot: Bot, queue: asyncio.PriorityQueue, worker_id: str
             print(f"[Worker {worker_id}] Success: Sent {full_title} from {source}")
 
         except Exception as e:
-            print(f"[Worker {worker_id}] Critical error in worker: {e}", exc_info=True)
+            print(f"[Worker {worker_id}] Critical error in worker: {e}")
+            traceback.print_exc()
             if 'call' in locals():
                 try:
                     await call.message.edit_text("❌ Произошла непредвиденная ошибка при обработке вашего запроса.")
